@@ -354,6 +354,16 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
             .map_err(|error| format!("升级归档续传统计失败：{error}"))?;
     }
     if connection
+        .prepare("SELECT start_page FROM archive_checkpoints LIMIT 0")
+        .is_err()
+    {
+        connection
+            .execute_batch(
+                "ALTER TABLE archive_checkpoints ADD COLUMN start_page INTEGER NOT NULL DEFAULT 1;",
+            )
+            .map_err(|error| format!("升级归档开始页失败：{error}"))?;
+    }
+    if connection
         .prepare("SELECT category FROM archive_dynamics LIMIT 0")
         .is_err()
     {
@@ -551,6 +561,7 @@ fn save_page(
     feeds: &[Value],
     next_cursor: Option<&str>,
     reset_checkpoint_stats: bool,
+    start_page: u32,
 ) -> Result<u64, String> {
     let mut connection = open_database(app)?;
     let transaction = connection
@@ -560,18 +571,18 @@ fn save_page(
     if let Some(cursor) = next_cursor {
         if reset_checkpoint_stats {
             transaction.execute(
-                "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at) VALUES (?1,?2,1,?3,?4,?5)
+                "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at,start_page) VALUES (?1,?2,1,?3,?4,?5,?6)
                  ON CONFLICT(owner_uin) DO UPDATE SET attach_info=excluded.attach_info,
-                  pages=1,fetched=excluded.fetched,saved=excluded.saved,updated_at=excluded.updated_at",
-                params![owner_uin, cursor, feeds.len() as u64, saved, now()],
+                  pages=1,fetched=excluded.fetched,saved=excluded.saved,updated_at=excluded.updated_at,start_page=excluded.start_page",
+                params![owner_uin, cursor, feeds.len() as u64, saved, now(), start_page],
             ).map_err(|error| format!("重置归档续传位置失败：{error}"))?;
         } else {
             transaction.execute(
-                "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at) VALUES (?1,?2,1,?3,?4,?5)
+                "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at,start_page) VALUES (?1,?2,1,?3,?4,?5,?6)
                  ON CONFLICT(owner_uin) DO UPDATE SET attach_info=excluded.attach_info,
                   pages=archive_checkpoints.pages+1,fetched=archive_checkpoints.fetched+excluded.fetched,
-                  saved=archive_checkpoints.saved+excluded.saved,updated_at=excluded.updated_at",
-                params![owner_uin, cursor, feeds.len() as u64, saved, now()],
+                  saved=archive_checkpoints.saved+excluded.saved,updated_at=excluded.updated_at,start_page=excluded.start_page",
+                params![owner_uin, cursor, feeds.len() as u64, saved, now(), start_page],
             ).map_err(|error| format!("保存归档续传位置失败：{error}"))?;
         }
     } else {
@@ -605,11 +616,34 @@ fn save_retried_page(
 }
 
 struct ArchiveCheckpoint {
+    start_page: u32,
     cursor: String,
     pages: u32,
     fetched: u64,
     saved: u64,
     updated_at: i64,
+}
+
+fn archive_start_position(
+    requested: Option<u32>,
+    checkpoint: Option<&ArchiveCheckpoint>,
+    timestamp: i64,
+) -> (u32, bool) {
+    if let Some(page) = requested {
+        return (page, false);
+    }
+    let Some(checkpoint) = checkpoint else {
+        return (1, false);
+    };
+    let stale = checkpoint_is_stale(checkpoint, timestamp);
+    let target = if stale {
+        checkpoint
+            .start_page
+            .max(checkpoint.pages.saturating_add(1))
+    } else {
+        checkpoint.start_page
+    };
+    (target, stale)
 }
 
 const ARCHIVE_RATE_WINDOW_SECONDS: i64 = 10 * 60;
@@ -846,7 +880,7 @@ fn load_checkpoint(
 ) -> Result<Option<ArchiveCheckpoint>, String> {
     let connection = open_database(app)?;
     match connection.query_row(
-        "SELECT attach_info,pages,fetched,saved,updated_at FROM archive_checkpoints WHERE owner_uin=?1",
+        "SELECT attach_info,pages,fetched,saved,updated_at,start_page FROM archive_checkpoints WHERE owner_uin=?1",
         params![owner_uin],
         |row| {
             Ok(ArchiveCheckpoint {
@@ -855,11 +889,11 @@ fn load_checkpoint(
                 fetched: row.get(2)?,
                 saved: row.get(3)?,
                 updated_at: row.get(4)?,
+                start_page: row.get(5)?,
             })
         },
     ) {
-        Ok(checkpoint) if !checkpoint.cursor.trim().is_empty() => Ok(Some(checkpoint)),
-        Ok(_) => Ok(None),
+        Ok(checkpoint) => Ok(Some(checkpoint)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(format!("读取归档续传位置失败：{error}")),
     }
@@ -1425,7 +1459,11 @@ pub async fn start_feed_archive(
     login: tauri::State<'_, QLoginState>,
     archive: tauri::State<'_, ArchiveState>,
     interval_ms: u64,
+    start_page: Option<u32>,
 ) -> Result<ArchiveProgress, String> {
+    if start_page == Some(0) {
+        return Err("开始页必须是大于等于 1 的整数".into());
+    }
     let interval_ms = interval_ms.clamp(2_000, 30_000);
     if archive.batch_retrying.load(Ordering::Relaxed) {
         return Err("正在批量重试异常位置，请等待完成或停止后再开始归档".into());
@@ -1451,23 +1489,33 @@ pub async fn start_feed_archive(
     let saved_skip_count = unresolved_skip_count(&app, &owner_uin)?;
     set_progress(&archive, |progress| progress.skipped = saved_skip_count);
     let checkpoint = load_checkpoint(&app, &owner_uin)?;
-    let stale_checkpoint = checkpoint
-        .as_ref()
-        .is_some_and(|value| checkpoint_is_stale(value, now()));
-    let mut reset_checkpoint_stats = stale_checkpoint;
+    let (target_page, stale_checkpoint) =
+        archive_start_position(start_page, checkpoint.as_ref(), now());
+    let checkpoint = checkpoint.filter(|_| start_page.is_none());
+    if start_page.is_some() || stale_checkpoint {
+        open_database(&app)?.execute(
+            "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at,start_page) VALUES (?1,'',0,0,0,?2,?3)
+             ON CONFLICT(owner_uin) DO UPDATE SET attach_info='',pages=0,fetched=0,saved=0,updated_at=excluded.updated_at,start_page=excluded.start_page",
+            params![owner_uin, now(), target_page],
+        ).map_err(|error| format!("保存归档开始位置失败：{error}"))?;
+    }
+    let mut reset_checkpoint_stats = stale_checkpoint || start_page.is_some();
     let mut cursor = checkpoint
         .as_ref()
-        .filter(|_| !stale_checkpoint)
+        .filter(|value| !stale_checkpoint && !value.cursor.trim().is_empty())
         .map(|value| value.cursor.clone());
     let mut seen_cursors = HashSet::new();
     if stale_checkpoint {
         set_progress(&archive, |progress| {
-            progress.message =
-                "上次分页位置已超过 10 分钟，正在从第一页重新校验；已保存记录会自动去重。".into();
+            progress.message = format!(
+                "上次分页游标已过期，正在重新定位第 {target_page} 页；之前的页面不会重复归档。"
+            );
         });
     } else if let Some(checkpoint) = checkpoint.as_ref() {
         let saved_cursor = &checkpoint.cursor;
-        seen_cursors.insert(saved_cursor.clone());
+        if !saved_cursor.trim().is_empty() {
+            seen_cursors.insert(saved_cursor.clone());
+        }
         set_progress(&archive, |progress| {
             progress.pages = checkpoint.pages;
             progress.fetched = checkpoint.fetched;
@@ -1593,7 +1641,10 @@ pub async fn start_feed_archive(
                 }
                 first_page_result.ok_or("第一页获取空间动态失败：未知错误")?
             };
-            let fetched = page.feeds.len() as u64;
+            let current_page = archive.progress.lock().map_err(|_| "归档状态锁已损坏")?.pages.saturating_add(1);
+            let positioning = current_page < target_page;
+            let feeds = if positioning { &[][..] } else { page.feeds.as_slice() };
+            let fetched = feeds.len() as u64;
             let next = if page.has_more {
                 Some(
                     page.attach_info
@@ -1631,7 +1682,7 @@ pub async fn start_feed_archive(
                     },
                 )?;
             }
-            let saved = save_page(&app, &owner_uin, &page.feeds, next, reset_checkpoint_stats)?;
+            let saved = save_page(&app, &owner_uin, feeds, next, reset_checkpoint_stats, target_page)?;
             reset_checkpoint_stats = false;
             let skip_count = unresolved_skip_count(&app, &owner_uin)?;
             set_progress(&archive, |progress| {
@@ -1639,7 +1690,9 @@ pub async fn start_feed_archive(
                 progress.fetched += fetched;
                 progress.saved += saved;
                 progress.skipped = skip_count;
-                progress.message = if did_skip {
+                progress.message = if positioning {
+                    format!("正在定位第 {target_page} 页：已读取第 {} 页，之前的页面不写入归档", progress.pages)
+                } else if did_skip {
                     format!(
                         "已跳过 1 个异常位置并继续归档；当前 {} 页，共 {} 条记录",
                         progress.pages, progress.fetched
@@ -1670,7 +1723,12 @@ pub async fn start_feed_archive(
         }),
         Ok(()) => set_progress(&archive, |p| {
             p.status = "completed";
-            p.message = if p.skipped > 0 {
+            p.message = if p.pages < target_page {
+                format!(
+                    "数据已结束，仅有 {} 页，未到达指定开始页 {target_page}；本次未写入归档",
+                    p.pages
+                )
+            } else if p.skipped > 0 {
                 format!(
                     "归档完成，共保存 {} 条记录；另有 {} 个异常位置已跳过，可在下方单独重试",
                     p.saved, p.skipped
@@ -2903,9 +2961,9 @@ pub async fn list_interactors(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, comment_from_values,
-        merge_comments, parse_feed, parse_feed_cursor, serialize_query_pairs, skip_probe_offsets,
-        ArchiveCheckpoint, FeedCursorDetails,
+        advance_feed_cursor, archive_page_delay_ms, archive_start_position, checkpoint_is_stale,
+        comment_from_values, merge_comments, parse_feed, parse_feed_cursor, serialize_query_pairs,
+        skip_probe_offsets, ArchiveCheckpoint, FeedCursorDetails,
     };
     use serde_json::json;
 
@@ -3156,6 +3214,7 @@ mod tests {
     #[test]
     fn expires_old_resume_cursor_without_discarding_archive_rows() {
         let checkpoint = ArchiveCheckpoint {
+            start_page: 1,
             cursor: "temporary-cursor".into(),
             pages: 78,
             fetched: 706,
@@ -3165,6 +3224,47 @@ mod tests {
 
         assert!(!checkpoint_is_stale(&checkpoint, 1_599));
         assert!(checkpoint_is_stale(&checkpoint, 1_600));
+    }
+
+    #[test]
+    fn expired_cursor_relocates_to_next_unread_page() {
+        let checkpoint = ArchiveCheckpoint {
+            start_page: 20,
+            cursor: "cursor".into(),
+            pages: 78,
+            fetched: 10,
+            saved: 10,
+            updated_at: 1_000,
+        };
+        assert_eq!(
+            archive_start_position(None, Some(&checkpoint), 1_599),
+            (20, false)
+        );
+        assert_eq!(
+            archive_start_position(None, Some(&checkpoint), 1_600),
+            (79, true)
+        );
+        assert_eq!(
+            archive_start_position(Some(5), Some(&checkpoint), 1_600),
+            (5, false)
+        );
+    }
+
+    #[test]
+    fn interrupted_positioning_keeps_requested_page() {
+        let checkpoint = ArchiveCheckpoint {
+            start_page: 500,
+            cursor: "".into(),
+            pages: 0,
+            fetched: 0,
+            saved: 0,
+            updated_at: 1_000,
+        };
+        assert_eq!(
+            archive_start_position(None, Some(&checkpoint), 1_600),
+            (500, true)
+        );
+        assert_eq!(archive_start_position(None, None, 1_600), (1, false));
     }
 
     #[test]
