@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { storeToRefs } from "pinia";
 import Button from "primevue/button";
 import ProgressBar from "primevue/progressbar";
+import InputNumber from "primevue/inputnumber";
 import Tag from "primevue/tag";
 import {
   cancelFeedArchive, clearResolvedArchiveSkips, getArchiveProgress, listArchiveSkips, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive,
@@ -14,6 +15,10 @@ import { getArchiveInterval } from "../utils/appSettings";
 const authStore = useAuthStore();
 const { loggedIn } = storeToRefs(authStore);
 const progress = ref<ArchiveProgress>({ status: "idle", pages: 0, fetched: 0, saved: 0, skipped: 0, message: "尚未开始归档" });
+const customStart = ref(false);
+const startPage = ref<number | null>(1);
+const startError = ref("");
+const validStartPage = computed(() => !customStart.value || (Number.isInteger(startPage.value) && Number(startPage.value) >= 1 && Number(startPage.value) <= 4294967295));
 const skips = ref<ArchiveSkipItem[]>([]);
 const retryingId = ref<number>();
 const skipNotice = ref("");
@@ -59,10 +64,13 @@ async function refresh() {
 }
 function beginPolling() { window.clearInterval(timer); timer = window.setInterval(() => { currentTime.value = Date.now(); void refresh(); }, 600); }
 async function start() {
-  if (!loggedIn.value) return;
+  if (!loggedIn.value || !validStartPage.value) return;
+  startError.value = "";
   beginPolling();
-  try { progress.value = await startFeedArchive(getArchiveInterval()); }
-  catch { await refresh(); }
+  const requestedPage = customStart.value && !rateLimited.value ? Number(startPage.value) : undefined;
+  customStart.value = false;
+  try { progress.value = await startFeedArchive(getArchiveInterval(), requestedPage); }
+  catch (error) { startError.value = String(error); await refresh(); }
   finally { await refresh(); if (progress.value.status === "limited") beginPolling(); else { window.clearInterval(timer); timer = undefined; } }
 }
 async function cancel() { await cancelFeedArchive(); await refresh(); }
@@ -140,10 +148,17 @@ onBeforeUnmount(() => window.clearInterval(timer));
     <ProgressBar v-if="running" mode="indeterminate" style="height: 7px" />
     <div v-if="rateLimited" class="task-rate-limit"><span><i class="pi pi-shield" /></span><div><strong>接口频率保护</strong><p>为防止接口请求过于频繁，每 10 分钟最多请求 300 页。归档进度已保存，{{ rateWaiting ? `等待 ${remainingText} 后可继续` : "现在可以继续归档" }}。</p></div><b v-if="rateWaiting">{{ remainingText }}</b></div>
     <div v-if="batchRetrying && batchProgress" class="task-batch-progress"><span><i class="pi pi-spin pi-spinner" /></span><div><strong>{{ batchStopping ? "正在停止批量重试…" : "批量重试异常位置" }}</strong><p>{{ batchProgressText }}{{ batchStopping ? " · 等待当前请求结束后停止" : "" }}</p><ProgressBar :value="(Math.min(batchProgress.current, batchProgress.total) / batchProgress.total) * 100" :show-value="false" style="height: 6px" /></div></div>
-    <div class="task-stats"><div><span>已读取页数</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
+    <div class="task-stats"><div><span>已读取至页码</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
     <div v-if="!loggedIn" class="task-login-notice"><span><i class="pi pi-lock" /></span><div><strong>请先登录 QQ 空间</strong><p>登录后才能创建或继续归档任务。</p></div><Button label="立即登录" icon="pi pi-sign-in" size="small" @click="authStore.openLogin" /></div>
+    <div class="archive-start-options">
+      <label><input v-model="customStart" type="checkbox" :disabled="running || batchRetrying || rateLimited" /> 从指定页开始新的归档</label>
+      <div v-if="customStart"><label for="archive-start-page">开始页</label> <InputNumber v-model="startPage" input-id="archive-start-page" :min="1" :max="4294967295" :max-fraction-digits="0" :use-grouping="false" :disabled="running || batchRetrying || rateLimited" /></div>
+      <small>{{ customStart ? "从第 1 页依次定位，开始页之前的数据不写入归档。新任务替换续传位置，已保存记录保留；暂停或限流后请继续上次进度。" : "优先继续上次进度，没有进度时从第 1 页开始。" }}</small>
+      <small v-if="!validStartPage" role="alert">请输入大于等于 1 的整数开始页。</small>
+      <p v-if="startError" role="alert">{{ startError }}</p>
+    </div>
     <div class="task-actions">
-      <Button :label="running ? '归档中…' : batchRetrying ? '批量重试中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="running || batchRetrying || rateWaiting || !loggedIn" @click="start" />
+      <Button :label="running ? '归档中…' : batchRetrying ? '批量重试中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="running || batchRetrying || rateWaiting || !loggedIn || !validStartPage" @click="start" />
       <Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" />
       <Button v-if="batchRetrying" :label="batchStopping ? '正在停止…' : '停止重试'" icon="pi pi-stop" severity="warn" outlined :loading="batchStopping" :disabled="batchStopping" @click="stopBatchRetry" />
     </div>
@@ -186,3 +201,9 @@ onBeforeUnmount(() => window.clearInterval(timer));
     </ul>
   </section>
 </template>
+
+<style scoped>
+.archive-start-options { display: grid; gap: 12px; margin: 20px 0; }
+.archive-start-options > label { display: flex; align-items: center; gap: 8px; }
+.archive-start-options small { color: var(--p-text-muted-color); line-height: 1.6; }
+</style>
