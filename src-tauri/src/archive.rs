@@ -763,6 +763,25 @@ fn advance_feed_cursor(cursor: &str, offset_advance: i64) -> Result<String, Stri
     Ok(serialize_query_pairs(&outer))
 }
 
+/// Use the first server-provided offset as the estimated page stride.
+/// Keep the server's time boundary and unrelated cursor fields intact.
+fn cursor_for_start_page(first_next_cursor: &str, start_page: u32) -> Result<String, String> {
+    if start_page < 2 {
+        return Err("直接跳转的开始页必须至少为 2".into());
+    }
+    let stride = parse_feed_cursor(first_next_cursor)?.offset;
+    if stride <= 0 {
+        return Err("接口未返回有效的分页步长，无法直接跳转".into());
+    }
+    if start_page == 2 {
+        return Ok(first_next_cursor.to_owned());
+    }
+    let advance = stride
+        .checked_mul(i64::from(start_page - 2))
+        .ok_or("目标分页偏移量过大")?;
+    advance_feed_cursor(first_next_cursor, advance)
+}
+
 fn unresolved_skip_count(app: &tauri::AppHandle, owner_uin: &str) -> Result<u32, String> {
     let connection = open_database(app)?;
     connection
@@ -1508,7 +1527,7 @@ pub async fn start_feed_archive(
     if stale_checkpoint {
         set_progress(&archive, |progress| {
             progress.message = format!(
-                "上次分页游标已过期，正在重新定位第 {target_page} 页；之前的页面不会重复归档。"
+                "上次分页游标已过期，将获取新游标并直接跳转第 {target_page} 页；之前的页面不会重复归档。"
             );
         });
     } else if let Some(checkpoint) = checkpoint.as_ref() {
@@ -1523,6 +1542,11 @@ pub async fn start_feed_archive(
             progress.message = format!("已恢复上次进度：{} 页，正在继续归档…", checkpoint.pages);
         });
     }
+    let mut direct_seek_pending = cursor.is_some()
+        && target_page > 1
+        && checkpoint
+            .as_ref()
+            .is_some_and(|value| value.pages == target_page - 1 && value.fetched == 0);
     let result: Result<(), String> = async {
         loop {
             if archive.cancel.load(Ordering::Relaxed) {
@@ -1561,6 +1585,9 @@ pub async fn start_feed_archive(
                 } else {
                     match qzone::fetch_feeds(&login, "2", Some(current_cursor)).await {
                         Ok(page) => page,
+                        Err(error) if direct_seek_pending => {
+                            return Err(format!("直接跳转第 {target_page} 页失败：{error}；跳转位置已保留，可重试或选择较小的开始页"));
+                        }
                         Err(error) if qzone::feed_error_can_skip(&error) => {
                             let details =
                                 parse_feed_cursor(current_cursor).map_err(|cursor_error| {
@@ -1641,6 +1668,32 @@ pub async fn start_feed_archive(
                 }
                 first_page_result.ok_or("第一页获取空间动态失败：未知错误")?
             };
+            if cursor.is_none() && target_page > 1 {
+                if !page.has_more {
+                    return Err("第一页未返回后续分页游标，无法跳转到指定页".into());
+                }
+                let first_next = page.attach_info.as_deref().ok_or("接口未返回分页游标")?;
+                let jump_cursor = cursor_for_start_page(first_next, target_page)?;
+                // Persist the requested cursor before sending it, so failures retry the same position.
+                open_database(&app)?.execute(
+                    "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at,start_page) VALUES (?1,?2,?3,0,0,?4,?5)
+                     ON CONFLICT(owner_uin) DO UPDATE SET attach_info=excluded.attach_info,pages=excluded.pages,fetched=0,saved=0,updated_at=excluded.updated_at,start_page=excluded.start_page",
+                    params![owner_uin, jump_cursor, target_page - 1, now(), target_page],
+                ).map_err(|error| format!("保存跳转位置失败：{error}"))?;
+                reset_checkpoint_stats = false;
+                set_progress(&archive, |progress| {
+                    progress.pages = target_page - 1;
+                    progress.message = format!("已获取有效游标，正在直接跳转至第 {target_page} 页（按接口偏移量估算）…");
+                });
+                cursor = Some(jump_cursor);
+                direct_seek_pending = true;
+                tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(interval_ms))).await;
+                continue;
+            }
+            if direct_seek_pending && page.feeds.is_empty() {
+                return Err(format!("第 {target_page} 页跳转未返回记录，可能超出数据范围或接口不接受该偏移；位置已保留，请选择较小的开始页"));
+            }
+            direct_seek_pending = false;
             let current_page = archive.progress.lock().map_err(|_| "归档状态锁已损坏")?.pages.saturating_add(1);
             let positioning = current_page < target_page;
             let feeds = if positioning { &[][..] } else { page.feeds.as_slice() };
@@ -2962,8 +3015,8 @@ pub async fn list_interactors(
 mod tests {
     use super::{
         advance_feed_cursor, archive_page_delay_ms, archive_start_position, checkpoint_is_stale,
-        comment_from_values, merge_comments, parse_feed, parse_feed_cursor, serialize_query_pairs,
-        skip_probe_offsets, ArchiveCheckpoint, FeedCursorDetails,
+        comment_from_values, cursor_for_start_page, merge_comments, parse_feed, parse_feed_cursor,
+        serialize_query_pairs, skip_probe_offsets, ArchiveCheckpoint, FeedCursorDetails,
     };
     use serde_json::json;
 
@@ -3248,6 +3301,30 @@ mod tests {
             archive_start_position(Some(5), Some(&checkpoint), 1_600),
             (5, false)
         );
+    }
+
+    #[test]
+    fn seeks_using_server_offset_and_preserves_time_boundary() {
+        let backend = serialize_query_pairs(&[
+            ("offset".into(), "10".into()),
+            ("basetime".into(), "12345".into()),
+        ]);
+        let attach = serialize_query_pairs(&[("back_server_info".into(), backend)]);
+        let cursor = serialize_query_pairs(&[
+            ("att".into(), attach),
+            ("loadcount".into(), "1".into()),
+            ("tl".into(), "preserved".into()),
+        ]);
+        assert_eq!(cursor_for_start_page(&cursor, 2).unwrap(), cursor);
+        let jumped = cursor_for_start_page(&cursor, 500).unwrap();
+        let details = parse_feed_cursor(&jumped).unwrap();
+        assert_eq!(details.offset, 4990);
+        assert_eq!(details.base_time, 12345);
+        assert!(jumped.contains("tl=preserved"));
+        assert!(cursor_for_start_page(&cursor, 1).is_err());
+        let invalid = cursor.replace("offset%253D10", "offset%253D0");
+        assert!(cursor_for_start_page(&invalid, 3).is_err());
+        assert!(cursor_for_start_page("invalid", 500).is_err());
     }
 
     #[test]

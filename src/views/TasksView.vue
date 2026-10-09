@@ -148,12 +148,12 @@ onBeforeUnmount(() => window.clearInterval(timer));
     <ProgressBar v-if="running" mode="indeterminate" style="height: 7px" />
     <div v-if="rateLimited" class="task-rate-limit"><span><i class="pi pi-shield" /></span><div><strong>接口频率保护</strong><p>为防止接口请求过于频繁，每 10 分钟最多请求 300 页。归档进度已保存，{{ rateWaiting ? `等待 ${remainingText} 后可继续` : "现在可以继续归档" }}。</p></div><b v-if="rateWaiting">{{ remainingText }}</b></div>
     <div v-if="batchRetrying && batchProgress" class="task-batch-progress"><span><i class="pi pi-spin pi-spinner" /></span><div><strong>{{ batchStopping ? "正在停止批量重试…" : "批量重试异常位置" }}</strong><p>{{ batchProgressText }}{{ batchStopping ? " · 等待当前请求结束后停止" : "" }}</p><ProgressBar :value="(Math.min(batchProgress.current, batchProgress.total) / batchProgress.total) * 100" :show-value="false" style="height: 6px" /></div></div>
-    <div class="task-stats"><div><span>已读取至页码</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
+    <div class="task-stats"><div><span>当前页码（跳转为估算）</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
     <div v-if="!loggedIn" class="task-login-notice"><span><i class="pi pi-lock" /></span><div><strong>请先登录 QQ 空间</strong><p>登录后才能创建或继续归档任务。</p></div><Button label="立即登录" icon="pi pi-sign-in" size="small" @click="authStore.openLogin" /></div>
     <div class="archive-start-options">
       <label><input v-model="customStart" type="checkbox" :disabled="running || batchRetrying || rateLimited" /> 从指定页开始新的归档</label>
       <div v-if="customStart"><label for="archive-start-page">开始页</label> <InputNumber v-model="startPage" input-id="archive-start-page" :min="1" :max="4294967295" :max-fraction-digits="0" :use-grouping="false" :disabled="running || batchRetrying || rateLimited" /></div>
-      <small>{{ customStart ? "从第 1 页依次定位，开始页之前的数据不写入归档。新任务替换续传位置，已保存记录保留；暂停或限流后请继续上次进度。" : "优先继续上次进度，没有进度时从第 1 页开始。" }}</small>
+      <small>{{ customStart ? "先获取第一页游标，再按接口偏移量直接跳转。页码为估算位置，列表变化或每页记录数变化可能造成偏移。新任务替换续传位置，已保存记录保留。" : "优先继续上次进度，没有进度时从第 1 页开始。" }}</small>
       <small v-if="!validStartPage" role="alert">请输入大于等于 1 的整数开始页。</small>
       <p v-if="startError" role="alert">{{ startError }}</p>
     </div>
